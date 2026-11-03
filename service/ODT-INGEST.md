@@ -172,3 +172,45 @@ Manifest:
 - Real Drive manuscript smoke: blocked by HTTP 403 quota error, not claimed successful.
 
 Implementation is on dedicated branch `odt-back-catalogue-ingest`; no push or merge.
+
+## Public-link real-data test
+
+The positional reference now also accepts an HTTPS public Google Drive file URL,
+including `/file/d/ID/view`, `/open?id=ID`, and resource-key links. This path uses
+Python standard-library HTTPS downloading with temporary in-memory cookies for
+Google's download-confirmation form. It does not call rclone, use Drive API
+credentials, or change server configuration. The file must be an original ODT
+with download access, not a Google Docs conversion. The supplied Drive file ID
+is retained as source. Downloads are limited to 128 MiB and checked as ODT ZIPs;
+login, quota, unrecognized HTML and unsupported confirmation pages fail explicitly.
+Browser download pages are a provider-controlled interface and may change.
+
+For the first real manuscript test, use a temporary empty destination and dry run:
+
+```sh
+export PATH=/home/jeremy/.local/bin:$PATH
+odt_test_dir=$(mktemp -d /tmp/odt-book-test.XXXXXX)
+mkdir "$odt_test_dir/chapters"
+python3 /home/jeremy/pipeline/extensions/scripts/odt_ingest.py \
+  'https://drive.google.com/file/d/FILE_ID/view?usp=sharing' \
+  --book-title 'BOOK TITLE' --target-dir "$odt_test_dir/chapters" \
+  --writer /home/jeremy/pipeline/service/target/debug/writenew \
+  --report "$odt_test_dir/preview.json" --dry-run
+```
+
+Review the report. To materialize the disposable test book, repeat the command
+without `--dry-run`, using `$odt_test_dir/ingest.json` as the report filename.
+No production vault is selected by these instructions. No source edits or model
+calls occur. Public retrieval cannot stat an authenticated Drive revision;
+it processes the downloaded bytes and identifies the source by the URL file ID.
+
+Verification: 9 Python tests passed, including public URL parsing/resource keys,
+direct and confirmation downloads, refusal of login/foreign pages and non-ODT
+ZIPs, plus the existing real-ODT preservation tests. A complete CLI smoke test
+with simulated public HTTP and a genuine ODT passed through the actual Rust
+writer: dry run left the destination empty, real creation produced two chapters
+and Book.md, source ID persisted, and retry refused a manually edited chapter.
+A live public manuscript download remains pending the user's source URL.
+
+Google's documented browser-download distinction:
+https://developers.google.com/workspace/drive/api/guides/manage-downloads

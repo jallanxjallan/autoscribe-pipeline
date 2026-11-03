@@ -1,5 +1,10 @@
 """Faithful, conservative ODT chapter ingest. No model or editorial processing."""
 import argparse
+import http.cookiejar
+from html.parser import HTMLParser
+import urllib.parse
+import urllib.request
+import urllib.error
 import copy
 import json
 from pathlib import Path
@@ -146,9 +151,94 @@ def parse_odt(path, source, level=1, pandoc='pandoc'):
             'issues': issues}
 
 
+MAX_DOWNLOAD_BYTES = 128 * 1024 * 1024
+
+
+def public_reference(reference):
+    url = urllib.parse.urlsplit(reference)
+    if url.scheme != 'https' or url.hostname not in {'drive.google.com', 'drive.usercontent.google.com'} or url.username or url.password or url.port:
+        raise IngestError('Expected an HTTPS Google Drive file URL')
+    match = re.fullmatch(r'/file/d/([A-Za-z0-9_-]+)(?:/[^/]*)?/?', url.path)
+    query = urllib.parse.parse_qs(url.query)
+    ids = [match[1]] if match else query.get('id', []) if url.path in {'/open', '/uc', '/download'} else []
+    if len(ids) != 1 or not re.fullmatch(r'[A-Za-z0-9_-]+', ids[0]):
+        raise IngestError('Expected one Google Drive file ID, not a folder or native Google Doc')
+    resourcekeys = query.get('resourcekey', [])
+    if len(resourcekeys) > 1 or any(not re.fullmatch(r'[A-Za-z0-9_-]+', key) for key in resourcekeys):
+        raise IngestError('Invalid Drive resource key')
+    params = {'export': 'download', 'id': ids[0]}
+    if resourcekeys:
+        params['resourcekey'] = resourcekeys[0]
+    return ids[0], 'https://drive.google.com/uc?' + urllib.parse.urlencode(params)
+
+
+def trusted_download_url(url):
+    parsed = urllib.parse.urlsplit(url)
+    host = parsed.hostname or ''
+    return (parsed.scheme == 'https' and not parsed.username and not parsed.password
+            and not parsed.port and (host in {'drive.google.com', 'drive.usercontent.google.com'}
+                                     or host.endswith('.googleusercontent.com')))
+
+
+class DriveRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        if not trusted_download_url(newurl):
+            raise IngestError('Drive redirected outside public download hosts; check anyone-with-link access')
+        return super().redirect_request(request, fp, code, msg, headers, newurl)
+
+
+class DownloadForm(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.action, self.fields, self.active = None, {}, False
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == 'form' and attrs.get('id') == 'download-form':
+            if attrs.get('method', 'get').lower() != 'get':
+                return
+            self.action, self.active = attrs.get('action'), True
+        elif tag == 'input' and self.active and attrs.get('type') == 'hidden' and attrs.get('name'):
+            self.fields[attrs['name']] = attrs.get('value', '')
+
+    def handle_endtag(self, tag):
+        if tag == 'form':
+            self.active = False
+
+
+def download_public(reference, destination, opener=None):
+    source, url = public_reference(reference)
+    opener = opener or urllib.request.build_opener(DriveRedirect(), urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+    for attempt in range(2):
+        with opener.open(url, timeout=60) as response:
+            if not trusted_download_url(response.geturl()):
+                raise IngestError('Unexpected public download destination')
+            prefix = response.read(4096)
+            if prefix.startswith(b'PK\x03\x04'):
+                total = len(prefix)
+                with destination.open('xb') as output:
+                    output.write(prefix)
+                    while chunk := response.read(1024 * 1024):
+                        total += len(chunk)
+                        if total > MAX_DOWNLOAD_BYTES:
+                            raise IngestError('Drive download exceeds 128 MiB limit')
+                        output.write(chunk)
+                with zipfile.ZipFile(destination) as archive:
+                    if archive.read('mimetype') != b'application/vnd.oasis.opendocument.text':
+                        raise IngestError('Drive file is not an original ODT manuscript')
+                return source
+            page = prefix + response.read(1024 * 1024)
+            form = DownloadForm()
+            form.feed(page.decode('utf-8', errors='replace'))
+            if attempt or not form.action or form.fields.get('id') != source or not trusted_download_url(form.action):
+                raise IngestError('Drive returned a sharing, login, quota, or unsupported download page; verify anyone-with-link access to the original ODT')
+            url = form.action + ('&' if '?' in form.action else '?') + urllib.parse.urlencode(form.fields)
+    raise IngestError('Public Drive download did not complete')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('reference', help='gdrive: path to the original ODT (read only)')
+    parser.add_argument('reference', help='Public Google Drive file URL or authenticated gdrive: ODT path')
     parser.add_argument('--book-title', required=True)
     parser.add_argument('--target-dir', type=Path, required=True, help='Existing empty destination directory')
     parser.add_argument('--heading-level', type=int, choices=range(1, 7), default=1)
@@ -156,23 +246,27 @@ def main():
     parser.add_argument('--report', type=Path, required=True, help='New JSON report file; never overwritten')
     parser.add_argument('--writer', default='writenew')
     args = parser.parse_args()
-    if not args.reference.startswith('gdrive:') or not args.reference.lower().endswith('.odt'):
-        parser.error('reference must be a gdrive: path to an ODT file')
+    public = not args.reference.startswith('gdrive:')
+    if not public and not args.reference.lower().endswith('.odt'):
+        parser.error('gdrive: reference must name an ODT file')
     # rclone notices are not discarded; suppress routine log output, retain errors.
     flags = ['--log-level=ERROR', '--retries=1', '--low-level-retries=1', '--timeout=30s']
     try:
         def stat():
             return json.loads(command('rclone', 'lsjson', args.reference, '--stat', *flags))
-        before = stat()
-        source = before.get('ID', '')
-        if before.get('IsDir') or not source:
-            raise IngestError('Drive did not return an original file and stable ID')
         with tempfile.TemporaryDirectory(prefix='odt-ingest-') as directory:
             local = Path(directory) / 'source.odt'
-            command('rclone', 'copyto', args.reference, local, *flags)
-            after = stat()
-            if any(before.get(k) != after.get(k) for k in ('ID', 'Size', 'ModTime')):
-                raise IngestError('Drive source changed during retrieval')
+            if public:
+                source = download_public(args.reference, local)
+            else:
+                before = stat()
+                source = before.get('ID', '')
+                if before.get('IsDir') or not source:
+                    raise IngestError('Drive did not return an original file and stable ID')
+                command('rclone', 'copyto', args.reference, local, *flags)
+                after = stat()
+                if any(before.get(k) != after.get(k) for k in ('ID', 'Size', 'ModTime')):
+                    raise IngestError('Drive source changed during retrieval')
             report = parse_odt(local, source, args.heading_level)
         report.update(source=source, reference=args.reference, book_title=args.book_title,
                       intended_files=[f'Chapter {i:04}.md' for i in range(1, len(report['records'])+1)] + ['Book.md'])
@@ -187,7 +281,7 @@ def main():
             options.append('--dry-run')
         result = command(args.writer, *options, data=stream)
         print(result.decode(), end='')
-    except (IngestError, OSError, ValueError, zipfile.BadZipFile, ET.ParseError) as error:
+    except (IngestError, OSError, ValueError, zipfile.BadZipFile, ET.ParseError, KeyError, urllib.error.URLError) as error:
         parser.exit(1, f'odt-ingest: {error}\n')
 
 
