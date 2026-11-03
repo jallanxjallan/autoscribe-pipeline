@@ -56,3 +56,12 @@ refuses existing files and symlinks; no conversion job or temporary defaults exi
 
 `AscClient` owns the `asc export list-pending` and `update-exports` subprocesses.
 Writeback requires no separate result extraction.
+
+Optional book creation (`writenew --book-title TITLE --target-dir DIR`) reuses these
+NDJSON envelopes with exactly `source` (stable Drive file ID) and `chapter`
+(consecutive integer from 1) in `input_record`. Content must be nonempty body-only
+Markdown. The adapter validates all records, requires an empty existing directory,
+adds type-based canonical creation metadata and identities, and delegates chapter
+and ordered flat manifest creation to the existing writer. `--dry-run` prints
+prospective records without writing the destination. Default writenew behavior and
+all dispatch/writeback NDJSON contracts remain unchanged. See ODT-INGEST.md.
