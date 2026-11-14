@@ -47,12 +47,19 @@ receipts recover from reachable matching trailers and target blobs. Blocked rows
 remain pending and do not block independent responses. No legacy manifest writeback
 path, new database schema, daemon invocation or automatic synchronization exists.
 
-`writenew` accepts NDJSON with object `input_record`, a non-empty slug, optional
-non-empty filename hint, and non-empty content. Its existing destination rules apply.
-The native writer emits the supplied scalar metadata in sorted key order, with
-JSON-compatible YAML quoting, followed by the response body and a final newline.
-Nested metadata is rejected. Response frontmatter is discarded. Exclusive creation
-refuses existing files and symlinks; no conversion job or temporary defaults exist.
+`writenew` accepts the existing NDJSON envelope. `input_record.slug` is the
+source identity and becomes `source_slug` provenance. It may be omitted when
+`filename_hint` is present. A slug in supplied frontmatter must match the
+source assertion. Destination assertions are rejected. The output identity is
+the new file's canonical `slug`; the CLI keeps its existing empty stdout.
+
+`--target-dir` names the vault root (the current directory by default).
+`_tools/config.yaml` supplies the relative passage route. The CLI invokes
+`/usr/bin/python3 -B -m biznet_common.identity`, so the matching Common package
+must be available to that interpreter. It stages all files, syncs their data,
+and publishes each complete file exclusively. Identical filename replays fail
+without changing existing files. Batch publication is not a crash-atomic
+transaction across filenames.
 
 `AscClient` owns the `asc export list-pending` and `update-exports` subprocesses.
 Writeback requires no separate result extraction.
